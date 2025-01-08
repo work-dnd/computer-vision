@@ -1,0 +1,200 @@
+======== Detection + tracking: Adaptive Detection Frequency =============
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import torch
+from deep_sort.deep_sort import DeepSort
+import time
+
+class AdaptiveDetectionTracker:
+    def __init__(self, 
+                 yolo_model="yolov8n.pt", 
+                 min_detection_freq=3,
+                 max_detection_freq=15,
+                 confidence=0.5):
+        # Initialize YOLO detector
+        self.detector = YOLO(yolo_model)
+        self.confidence = confidence
+        
+        # Initialize DeepSORT tracker
+        self.tracker = DeepSort(
+            model_path="deep_sort/deep/checkpoint/ckpt.t7",
+            max_dist=0.2,
+            min_confidence=0.3,
+            max_iou_distance=0.7,
+            max_age=70,
+            n_init=3,
+            nn_budget=100
+        )
+        
+        # Adaptive detection frequency parameters
+        self.min_detection_freq = min_detection_freq
+        self.max_detection_freq = max_detection_freq
+        self.current_detection_freq = min_detection_freq
+        
+        # Tracking metrics for adaptivity
+        self.frame_count = 0
+        self.track_metrics = {
+            'track_switches': 0,      # Number of track ID switches
+            'track_lost': 0,          # Number of tracks lost
+            'detection_confidence': 0 # Average detection confidence
+        }
+        
+        # Tracking state
+        self.previous_tracks = []
+        self.previous_class_ids = []
+        
+        # Colors and class tracking
+        self.colors = np.random.randint(0, 255, size=(100, 3))
+        self.track_classes = {}
+        
+    def calculate_detection_frequency(self):
+        """
+        Dynamically adjust detection frequency based on tracking metrics
+        """
+        # Metrics for adaptation
+        track_switch_penalty = self.track_metrics['track_switches'] * 2
+        track_lost_penalty = self.track_metrics['track_lost'] * 3
+        
+        # Confidence boost (more detections if low confidence)
+        confidence_boost = max(0, (0.5 - self.track_metrics['detection_confidence']) * 5)
+        
+        # Calculate adjustment
+        adjustment = track_switch_penalty + track_lost_penalty + confidence_boost
+        
+        # Adjust detection frequency
+        self.current_detection_freq = max(
+            self.min_detection_freq, 
+            min(self.max_detection_freq, 
+                self.current_detection_freq + int(adjustment))
+        )
+        
+        # Reset metrics
+        self.track_metrics = {
+            'track_switches': 0,
+            'track_lost': 0,
+            'detection_confidence': 0
+        }
+        
+    def run_detection(self, frame):
+        """
+        Run YOLO detection and format results
+        """
+        results = self.detector(frame, verbose=False)[0]
+        detection_results = []
+        class_ids = []
+        
+        # Process YOLO detections
+        total_conf = 0
+        for detection in results.boxes.data.tolist():
+            x1, y1, x2, y2, conf, class_id = detection
+            if conf >= self.confidence:
+                detection_results.append([x1, y1, x2, y2, conf])
+                class_ids.append(int(class_id))
+                total_conf += conf
+        
+        # Update detection confidence metric
+        self.track_metrics['detection_confidence'] = (
+            total_conf / len(detection_results) if detection_results else 0
+        )
+        
+        return detection_results, class_ids, results.names
+    
+    def process_frame(self, frame):
+        """
+        Process frame with adaptive detection frequency
+        """
+        # Run detection only at calculated frequency
+        if self.frame_count % self.current_detection_freq == 0:
+            detection_results, class_ids, class_names = self.run_detection(frame)
+            
+            if detection_results:
+                # Convert detections to DeepSORT format
+                detections = np.array(detection_results)
+                bbox_tlwh = self._xyxy_to_tlwh(detections[:, :4])
+                confidences = detections[:, 4]
+                
+                # Update tracker with new detections
+                tracks = self.tracker.update(bbox_tlwh, confidences, class_ids, frame)
+                
+                # Track ID switches and lost tracks
+                if len(self.previous_tracks) > 0:
+                    # Compare current tracks with previous tracks
+                    current_track_ids = set(tracks[:, 4])
+                    prev_track_ids = set(self.previous_tracks[:, 4])
+                    
+                    # Track switches
+                    self.track_metrics['track_switches'] += len(current_track_ids.symmetric_difference(prev_track_ids))
+                    
+                    # Lost tracks
+                    self.track_metrics['track_lost'] += len(prev_track_ids - current_track_ids)
+                
+                # Store current tracks
+                self.previous_tracks = tracks
+                self.previous_class_ids = class_ids
+            else:
+                # Detection frame with no objects
+                tracks = self.tracker.update(np.empty((0, 5)), np.array([]), np.array([]), frame)
+                self.track_metrics['track_lost'] += len(self.previous_tracks)
+        else:
+            # Non-detection frames: use previous tracks to predict
+            if len(self.previous_tracks) > 0:
+                tracks = self.tracker.update(
+                    self.previous_tracks[:, :4], 
+                    self.previous_tracks[:, 4], 
+                    self.previous_class_ids, 
+                    frame
+                )
+            else:
+                tracks = self.tracker.update(np.empty((0, 5)), np.array([]), np.array([]), frame)
+        
+        # Increment frame count and calculate new detection frequency periodically
+        self.frame_count += 1
+        if self.frame_count % 100 == 0:  # Recalculate every 100 frames
+            self.calculate_detection_frequency()
+        
+        # Draw tracking results
+        self.draw_tracks(frame, tracks)
+        
+        return frame
+    
+    # ... [rest of the previous implementation remains the same]
+
+    def run_on_video(self, source=0):
+        """
+        Run detection and tracking on video stream with adaptive frequency display
+        """
+        cap = cv2.VideoCapture(source)
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Process frame
+            processed_frame = self.process_frame(frame)
+            
+            # Display adaptive detection frequency
+            cv2.putText(processed_frame, 
+                       f"Detection Freq: {self.current_detection_freq}", 
+                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 
+                       1, (0, 255, 0), 2)
+            
+            cv2.imshow('Adaptive Detection Tracking', processed_frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        
+        cap.release()
+        cv2.destroyAllWindows()
+
+# Usage
+if __name__ == "__main__":
+    tracker = AdaptiveDetectionTracker(
+        yolo_model="yolov8n.pt",
+        min_detection_freq=3,
+        max_detection_freq=15,
+        confidence=0.5
+    )
+    tracker.run_on_video(0);

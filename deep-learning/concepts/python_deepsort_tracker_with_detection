@@ -1,0 +1,241 @@
+============= Detection with Tracking using Yolo and DeepSort =============
+
+- here detection is done at fixed intervals, so detection frequency may be 5 frames or else based on tracking performance
+(check other code for adaptive frequency handling)
+- in between the detection frames, tracker will keep track of the object using motion prediction
+- during those frames, either previous tracks or current detection would be given input to the tracker
+- if no track or no detection, tracker would be given empty input
+
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import torch
+from deep_sort.deep_sort import DeepSort
+import time
+
+class DetectionTracker:
+    def __init__(self, yolo_model="yolov8n.pt", confidence=0.5, detection_frequency=5):
+        # Initialize YOLO detector
+        self.detector = YOLO(yolo_model)
+        self.confidence = confidence
+        
+        # Initialize DeepSORT tracker
+        self.tracker = DeepSort(
+            model_path="deep_sort/deep/checkpoint/ckpt.t7",  # Path to ReID model weights
+            max_dist=0.2,          # Maximum distance for appearance metric
+            min_confidence=0.3,    # Min confidence for detection to be considered
+            max_iou_distance=0.7,  # Max IoU distance for track association
+            max_age=70,           # Max frames to keep track alive without detection
+            n_init=3,             # Frames needed to confirm track
+            nn_budget=100         # Maximum size of appearance feature gallery
+        )
+        
+        # Detection frequency control
+        self.detection_frequency = detection_frequency
+        self.frame_count = 0
+        
+        # Store last detection results
+        self.last_detections = []
+        self.last_features = []
+        
+        # Initialize colors for visualization
+        self.colors = np.random.randint(0, 255, size=(100, 3))
+        
+        # Dictionary to store class names for tracked objects
+        self.track_classes = {}
+        
+    def run_detection(self, frame):
+        """
+        Run YOLO detection and format results
+        """
+        results = self.detector(frame, verbose=False)[0]
+        detection_results = []
+        class_ids = []
+        
+        # Process YOLO detections
+        for detection in results.boxes.data.tolist():
+            x1, y1, x2, y2, conf, class_id = detection
+            if conf >= self.confidence:
+                detection_results.append([x1, y1, x2, y2, conf])
+                class_ids.append(int(class_id))
+                
+        self.last_detections = detection_results
+        return detection_results, class_ids, results.names
+    
+    def process_frame(self, frame):
+    """
+    Process a single frame with detection and tracking
+    Properly maintain and propagate track states
+    """
+    # Run detection only every N frames
+    if self.frame_count % self.detection_frequency == 0:
+        # Perform detection
+        detection_results, class_ids, class_names = self.run_detection(frame)
+        
+        if detection_results:
+            # Convert detections to DeepSORT format
+            detections = np.array(detection_results)
+            bbox_tlwh = self._xyxy_to_tlwh(detections[:, :4])
+            confidences = detections[:, 4]
+            
+            # Update tracker with new detections
+            tracks = self.tracker.update(bbox_tlwh, confidences, class_ids, frame)
+            
+            # Store these tracks for use in non-detection frames
+            self.previous_tracks = tracks
+            self.previous_class_ids = class_ids
+        else:
+            # Detection frame, but no objects detected
+            # Use previous tracks to predict
+            tracks = self.tracker.update(np.empty((0, 5)), np.array([]), np.array([]), frame)
+    else:
+        # Non-detection frames: use previous tracks to predict
+        if hasattr(self, 'previous_tracks') and len(self.previous_tracks) > 0:
+            # Convert previous tracks to input format for tracker
+            prev_bbox_tlwh = self.previous_tracks[:, :4]
+            prev_confidences = self.previous_tracks[:, 4]
+            
+            # Update tracker with previous tracks
+            tracks = self.tracker.update(
+                prev_bbox_tlwh, 
+                prev_confidences, 
+                self.previous_class_ids if hasattr(self, 'previous_class_ids') else [], 
+                frame
+            )
+        else:
+            # Fallback if no previous tracks exist
+            tracks = self.tracker.update(np.empty((0, 5)), np.array([]), np.array([]), frame)
+    
+    # Increment frame count
+    self.frame_count += 1
+    
+    # Draw tracking results
+    self.draw_tracks(frame, tracks)
+        
+    return frame
+    
+    @staticmethod
+    def _xyxy_to_tlwh(bbox_xyxy):
+        """
+        Convert bounding boxes from (x1,y1,x2,y2) to (top,left,width,height)
+        """
+        bbox_tlwh = bbox_xyxy.copy()
+        bbox_tlwh[:, 2] = bbox_xyxy[:, 2] - bbox_xyxy[:, 0]  # width
+        bbox_tlwh[:, 3] = bbox_xyxy[:, 3] - bbox_xyxy[:, 1]  # height
+        return bbox_tlwh
+    
+    def draw_detections(self, frame, detections, class_ids, class_names):
+        """
+        Draw detection boxes with class names
+        """
+        for det, class_id in zip(detections, class_ids):
+            x1, y1, x2, y2, conf = det
+            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+            
+            # Draw detection box in green
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # Draw class name and confidence
+            label = f"{class_names[class_id]}: {conf:.2f}"
+            cv2.putText(frame, label, (x1, y1 - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    
+    def draw_tracks(self, frame, tracks):
+        """
+        Draw tracking boxes with IDs and class names
+        """
+        for track in tracks:
+            x1, y1, x2, y2, track_id = track
+            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+            
+            # Get color for this track ID
+            color = self.colors[int(track_id) % len(self.colors)]
+            color = tuple(map(int, color))
+            
+            # Draw tracking box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            
+            # Draw track ID and class name if available
+            class_name = self.track_classes.get(track_id, "Unknown")
+            label = f"ID: {int(track_id)} ({class_name})"
+            cv2.putText(frame, label, (x1, y1 - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    def run_on_video(self, source=0):
+        """
+        Run detection and tracking on video stream
+        """
+        cap = cv2.VideoCapture(source)
+        fps_history = []
+        prev_time = time.time()
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            # Process frame
+            processed_frame = self.process_frame(frame)
+            
+            # Calculate and smooth FPS
+            current_time = time.time()
+            fps = 1 / (current_time - prev_time)
+            fps_history.append(fps)
+            if len(fps_history) > 30:
+                fps_history.pop(0)
+            avg_fps = sum(fps_history) / len(fps_history)
+            prev_time = current_time
+            
+            # Display FPS and frame info
+            cv2.putText(processed_frame, 
+                       f"FPS: {avg_fps:.1f} | {'Detection' if self.frame_count % self.detection_frequency == 0 else 'Tracking'}", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                       1, (0, 255, 0), 2)
+            
+            # Show frame
+            cv2.imshow('Detection + Tracking', processed_frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+                
+        cap.release()
+        cv2.destroyAllWindows()
+
+# Usage example
+if __name__ == "__main__":
+    # Initialize detector and tracker
+    det_tracker = DetectionTracker(
+        yolo_model="yolov8n.pt",
+        confidence=0.5,
+        detection_frequency=5
+    )
+    
+    # Run on webcam (0) or video file
+    det_tracker.run_on_video(0)
+    
+    
+    
+Thank you! This approach addresses the key challenges in object tracking:
+
+Computational Efficiency
+Reduces detection frequency
+Maintains tracking continuity
+Uses predictive tracking between detections
+Tracking Robustness
+Preserves object identities
+Handles temporary occlusions
+Provides smooth object trajectory
+
+Key advantages of this DeepSORT implementation:
+
+Uses deep learning features for robust ID maintenance
+Adaptive to different scenarios
+Configurable detection and tracking parameters
+Works across various object detection scenarios
+
+Potential further improvements could include:
+
+Adding more sophisticated occlusion handling
+Implementing adaptive detection frequency
+Adding confidence thresholds for track termination
